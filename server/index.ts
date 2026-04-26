@@ -82,24 +82,56 @@ function applySslToRemoteHosts(config: PoolConfig): PoolConfig {
   return config
 }
 
-/** Stops you from using tutorial placeholders that produce ENOTFOUND HOST:PORT */
-function assertNotPlaceholderPostgresConfig(config: PoolConfig): void {
-  const h = String(config.host ?? '').trim()
-  if (!h) {
-    return
+/**
+ * Tutorials use postgres://...USER:PASSWORD@HOST:PORT/... as a template — "HOST" and "PORT"
+ * must be replaced with the real values from your Railway Postgres service.
+ */
+function printPlaceholderHelpAndExit(): never {
+  console.error(
+    'Your DATABASE_URL still uses the example placeholder HOST:PORT (or @HOST) instead of a real hostname and port.\n' +
+      'DNS literally tries to look up a computer named "HOST" — that will never work.\n\n' +
+      'Fix in Railway:\n' +
+      '1) Open the Postgres (database) service → Connect, or the Variables tab.\n' +
+      '2) Copy the real connection URL (host looks like *.railway.app, *.rlwy.net, or *.railway.internal), OR\n' +
+      '3) In your *web* service → New Variable → Reference → pick Postgres → DATABASE_URL.\n' +
+      '4) Remove any .env you typed by hand that still says HOST or PORT as words in the host part.',
+  )
+  process.exit(1)
+}
+
+function isTutorialPlaceholderInConnectionString(s: string): boolean {
+  const t = s.trim()
+  if (!t) {
+    return false
   }
-  if (/^host(:port)?$/i.test(h) || h.toUpperCase() === 'HOST:PORT') {
-    console.error(
-      'Your Postgres host is still a PLACEHOLDER (e.g. HOST or HOST:PORT in an example .env), not a real machine name.\n' +
-        'In Railway: open the Postgres service (not the web app) → Connect (or Variables) → copy the real URL or each value.\n' +
-        'In your web app service, set DATABASE_URL with "Variable Reference" from that Postgres, or set PGHOST to the real hostname (looks like xxxxx.railway.app or .rlwy.net), never the word HOST.',
-    )
-    process.exit(1)
+  if (/@HOST:PORT(\/|\?|#|\s|"|'|$)/i.test(t) || /@HOST:PORT$/i.test(t)) {
+    return true
+  }
+  if (/@HOST(\/|\?|#|\s|"|'|$)/i.test(t) && /:\/\/[^/]+@HOST\//i.test(t)) {
+    return true
+  }
+  return false
+}
+
+/** Stops tutorial placeholders; also checks connectionString (pg may keep the URL in there). */
+function assertNotPlaceholderPostgresConfig(config: PoolConfig): void {
+  const cs = (config as { connectionString?: string }).connectionString
+  if (cs && isTutorialPlaceholderInConnectionString(cs)) {
+    printPlaceholderHelpAndExit()
+  }
+  const h = String(config.host ?? '').trim()
+  if (h) {
+    if (
+      /^host(:port)?$/i.test(h) ||
+      h.toUpperCase() === 'HOST:PORT' ||
+      h.toUpperCase() === 'HOST'
+    ) {
+      printPlaceholderHelpAndExit()
+    }
   }
   const g = process.env.PGHOST?.trim() ?? ''
-  if (g && /^host(:port)?$/i.test(g)) {
-    console.error('PGHOST is the literal placeholder "HOST". Replace with the real PGHOST from the Postgres service Variables tab.')
-    process.exit(1)
+  if (g && (/^host(:port)?$/i.test(g) || g.toUpperCase() === 'HOST:PORT' || g.toUpperCase() === 'HOST')) {
+    printPlaceholderHelpAndExit()
   }
 }
 
@@ -128,6 +160,10 @@ function buildPoolConfig(): PoolConfig {
       raw.slice(0, 40),
     )
     process.exit(1)
+  }
+
+  if (isTutorialPlaceholderInConnectionString(raw)) {
+    printPlaceholderHelpAndExit()
   }
 
   const repaired = repairPasswordWithUnencodedAt(raw)
@@ -390,6 +426,9 @@ void (async () => {
       break
     } catch (err) {
       const e = err as { code?: string; message?: string }
+      if (e.code === 'ENOTFOUND' && e.message?.includes('HOST:PORT')) {
+        printPlaceholderHelpAndExit()
+      }
       console.error(
         `Database setup (attempt ${attempt}/${DB_RETRIES}): [${e.code ?? 'n/a'}] ${describePgError(err)}`,
       )
