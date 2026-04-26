@@ -14,7 +14,7 @@ const isProd = process.env.NODE_ENV === 'production'
 
 /** Common when pasting into Railway: wrapped in quotes, which breaks URL parsing. */
 function normalizeDatabaseUrl(s: string): string {
-  let t = s.replace(/^\uFEFF/, '').trim()
+  let t = s.replace(/^\uFEFF/, '').replace(/[\n\r]+/g, '').trim()
   if (t.length >= 2) {
     const q0 = t[0]
     const q1 = t[t.length - 1]
@@ -25,15 +25,78 @@ function normalizeDatabaseUrl(s: string): string {
   return t
 }
 
+/**
+ * If the password contains a literal @ (not percent-encoded as %40), the URL will have
+ * more than one @ before the hostname and node-postgres cannot parse it. This rebuilds
+ * the userinfo with an encoded password.
+ */
+function repairPasswordWithUnencodedAt(url: string): string {
+  const scheme = url.match(/^(postgres(?:ql)?:\/\/)/i)?.[0]
+  if (!scheme) return url
+  const rest = url.slice(scheme.length)
+  const parts = rest.split('@')
+  if (parts.length < 3) {
+    return url
+  }
+  const first = parts[0] ?? ''
+  const hostAndPath = parts[parts.length - 1] ?? ''
+  const col = first.indexOf(':')
+  if (col < 0) {
+    return url
+  }
+  const user = first.slice(0, col)
+  const passPrefix = first.slice(col + 1)
+  const passMiddle = parts.slice(1, -1)
+  const password = [passPrefix, ...passMiddle].join('@')
+  return `${scheme}${user}:${encodeURIComponent(password)}@${hostAndPath}`
+}
+
+function buildPoolFromIndividualPgEnvs(): PoolConfig | null {
+  const host = process.env.PGHOST?.trim()
+  const user = process.env.PGUSER?.trim()
+  const database = process.env.PGDATABASE?.trim()
+  if (!host || !user || !database) {
+    return null
+  }
+  const port = process.env.PGPORT ? Number.parseInt(process.env.PGPORT, 10) : 5432
+  return {
+    host,
+    port: Number.isNaN(port) ? 5432 : port,
+    user,
+    password: process.env.PGPASSWORD ?? '',
+    database,
+  }
+}
+
+function applySslToRemoteHosts(config: PoolConfig): PoolConfig {
+  if (process.env.DATABASE_SSL === '0' || process.env.DATABASE_SSL === 'false') {
+    return { ...config, ssl: false }
+  }
+  const host = config.host ?? ''
+  const isLocal =
+    host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === ''
+  if (host && !isLocal) {
+    return { ...config, ssl: { rejectUnauthorized: false } }
+  }
+  return config
+}
+
 function buildPoolConfig(): PoolConfig {
   const raw = normalizeDatabaseUrl(process.env.DATABASE_URL ?? '')
   if (!raw) {
-    console.error('DATABASE_URL is missing or only whitespace.\n' +
-      'In Railway: add a PostgreSQL service, then in your web service set DATABASE_URL to a Reference from that Postgres (it looks like postgres://...).',
+    const fromEnv = buildPoolFromIndividualPgEnvs()
+    if (fromEnv) {
+      return applySslToRemoteHosts(fromEnv)
+    }
+    console.error('DATABASE_URL is missing. Set it from the Railway Postgres service, or set PGHOST, PGUSER, PGDATABASE, PGPASSWORD, PGPORT.',
     )
     process.exit(1)
   }
   if (!/^postgres(ql)?:\/\//i.test(raw)) {
+    const fromEnv = buildPoolFromIndividualPgEnvs()
+    if (fromEnv) {
+      return applySslToRemoteHosts(fromEnv)
+    }
     console.error(
       'DATABASE_URL must start with postgres:// or postgresql://\nGot prefix:',
       raw.slice(0, 40),
@@ -41,31 +104,33 @@ function buildPoolConfig(): PoolConfig {
     process.exit(1)
   }
 
-  let config: PoolConfig
-  try {
-    config = parseIntoClientConfig(raw) as PoolConfig
-  } catch (err) {
-    console.error(
-      'Could not parse DATABASE_URL for PostgreSQL. Common fixes:\n' +
-        '1) In Railway, use a Variable *Reference* from the Postgres service (no quotes when pasting in the UI).\n' +
-        '2) If the password has @ or :, use the URL Railway generates — do not retype it.\n' +
-        'Underlying error:',
-      err,
-    )
-    process.exit(1)
-  }
+  const repaired = repairPasswordWithUnencodedAt(raw)
+  const unique = [raw, repaired].filter((c, i, arr) => arr.indexOf(c) === i)
 
-  if (process.env.DATABASE_SSL === '0' || process.env.DATABASE_SSL === 'false') {
-    config.ssl = false
-  } else {
-    const host = config.host ?? ''
-    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1'
-    if (host && !isLocal) {
-      config.ssl = { rejectUnauthorized: false }
+  for (const candidate of unique) {
+    try {
+      const config = parseIntoClientConfig(candidate) as PoolConfig
+      return applySslToRemoteHosts(config)
+    } catch {
+      // try next
     }
   }
 
-  return config
+  const fromEnv = buildPoolFromIndividualPgEnvs()
+  if (fromEnv) {
+    console.error(
+      'Note: DATABASE_URL was invalid, but using PG* environment variables for the connection.',
+    )
+    return applySslToRemoteHosts(fromEnv)
+  }
+
+  console.error(
+    'Could not parse DATABASE_URL. Check:\n' +
+      '• Variable Reference from the Postgres service (one line, no template syntax left in the value)\n' +
+      '• Or set PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE manually\n' +
+      '• Passwords with @ must be percent-encoded as %40 in the URL, or use the @-repair (retry deploy after update)',
+  )
+  process.exit(1)
 }
 
 const pool = new Pool(buildPoolConfig())
