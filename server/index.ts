@@ -3,7 +3,7 @@ import cors from 'cors'
 import express, { type Request, type Response, type NextFunction } from 'express'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import pg from 'pg'
+import pg, { type PoolConfig } from 'pg'
 
 const { Pool } = pg
 
@@ -11,12 +11,54 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const distDir = path.join(__dirname, '../dist')
 const isProd = process.env.NODE_ENV === 'production'
 
-if (!process.env.DATABASE_URL) {
-  console.error('Missing DATABASE_URL (PostgreSQL connection string).')
-  process.exit(1)
+function buildPoolConfig(): PoolConfig {
+  const raw = (process.env.DATABASE_URL ?? '').trim()
+  if (!raw) {
+    console.error('DATABASE_URL is missing or only whitespace.\n' +
+      'In Railway: add a PostgreSQL service, then in your web service set DATABASE_URL to a Reference from that Postgres (it looks like postgres://...).',
+    )
+    process.exit(1)
+  }
+  if (!/^postgres(ql)?:\/\//i.test(raw)) {
+    console.error(
+      'DATABASE_URL must start with postgres:// or postgresql://\nGot prefix:',
+      raw.slice(0, 40),
+    )
+    process.exit(1)
+  }
+  try {
+    void new URL(raw)
+  } catch {
+    console.error(
+      'DATABASE_URL is not a valid URL for node-postgres.\n' +
+        'Do not type the string by hand. In Railway, open the Postgres plugin → use "Variable Reference" to inject its DATABASE_URL into this service.\n' +
+        'If you pasted manually, characters like @ or : in the password must be percent-encoded inside the URL.',
+    )
+    process.exit(1)
+  }
+
+  let useSsl: PoolConfig['ssl'] = false
+  if (process.env.DATABASE_SSL === '0' || process.env.DATABASE_SSL === 'false') {
+    useSsl = false
+  } else {
+    try {
+      const { hostname } = new URL(raw)
+      // Hosted DB (Railway, etc.) needs TLS; local Docker usually does not
+      if (hostname && hostname !== 'localhost' && hostname !== '127.0.0.1') {
+        useSsl = { rejectUnauthorized: false }
+      }
+    } catch {
+      // already exited above
+    }
+  }
+
+  return {
+    connectionString: raw,
+    ssl: useSsl,
+  }
 }
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL })
+const pool = new Pool(buildPoolConfig())
 const app = express()
 const port = Number(process.env.PORT) || 8787
 const requiredKey = process.env.DTC_API_KEY
