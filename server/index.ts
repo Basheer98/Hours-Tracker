@@ -158,6 +158,17 @@ app.use(
 )
 app.use(express.json({ limit: '32kb' }))
 
+app.use((req, res, next) => {
+  if (req.path === '/api/health' || !req.path.startsWith('/api')) {
+    return next()
+  }
+  if (!dbReady) {
+    res.status(503).json({ error: 'Database unavailable' })
+    return
+  }
+  return next()
+})
+
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 const TIME_RE = /^\d{2}:\d{2}$/
 
@@ -171,6 +182,29 @@ type Row = {
 function oneStr(p: string | string[] | undefined): string {
   if (p == null) return ''
   return Array.isArray(p) ? (p[0] ?? '') : p
+}
+
+let dbReady = false
+
+function describePgError(err: unknown): string {
+  const e = err as { code?: string; message?: string }
+  const c = e.code
+  if (c === 'ECONNREFUSED') {
+    return 'Postgres is not accepting connections (wrong host/port, or database not up yet).'
+  }
+  if (c === 'ENOTFOUND' || c === 'EAI_AGAIN') {
+    return 'Postgres host name could not be resolved. Check PGHOST / DATABASE_URL.'
+  }
+  if (c === 'ETIMEDOUT' || c === 'ESOCKETTIMEDOUT') {
+    return 'Connection to Postgres timed out (security group, or wrong network URL).'
+  }
+  if (c === '28P01') {
+    return 'Postgres rejected the password. Copy credentials again from the Postgres service.'
+  }
+  if (c === 'SELF_SIGNED_CERT_IN_CHAIN' || c === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+    return 'SSL certificate issue — try setting DATABASE_SSL=true in Railway and redeploy, or use the URL from the same cloud provider.'
+  }
+  return e.message ?? String(err)
 }
 
 async function ensureTable(): Promise<void> {
@@ -204,11 +238,15 @@ function auth(
 }
 
 app.get('/api/health', async (_req, res) => {
+  if (!dbReady) {
+    res.status(503).json({ ok: false, db: false, reason: 'Database not ready' })
+    return
+  }
   try {
     await pool.query('SELECT 1')
-    res.json({ ok: true })
+    res.json({ ok: true, db: true })
   } catch {
-    res.status(503).json({ ok: false })
+    res.status(503).json({ ok: false, db: false })
   }
 })
 
@@ -313,18 +351,47 @@ if (isProd) {
   })
 }
 
+const DB_RETRIES = 8
+const DB_RETRY_MS = 3000
+const allowStartNoDb = process.env.ALLOW_START_WITHOUT_DB === '1' || process.env.ALLOW_START_WITHOUT_DB === 'true'
+
 void (async () => {
-  try {
-    await ensureTable()
-  } catch (err) {
-    console.error('Database setup failed:', err)
-    process.exit(1)
+  for (let attempt = 1; attempt <= DB_RETRIES; attempt++) {
+    try {
+      await ensureTable()
+      dbReady = true
+      console.log('Postgres connected and day_entry table is ready.')
+      break
+    } catch (err) {
+      const e = err as { code?: string; message?: string }
+      console.error(
+        `Database setup (attempt ${attempt}/${DB_RETRIES}): [${e.code ?? 'n/a'}] ${describePgError(err)}`,
+      )
+      if (e.message && e.code !== 'ECONNREFUSED') {
+        console.error('(details)', e.message)
+      }
+      if (attempt < DB_RETRIES) {
+        await new Promise((r) => setTimeout(r, DB_RETRY_MS))
+      }
+    }
   }
-  app.listen(port, () => {
-    if (isProd) {
-      console.log(`DTC server listening on ${port}, static from ${distDir}`)
+
+  if (!dbReady) {
+    if (allowStartNoDb) {
+      console.error(
+        'Starting HTTP without database (ALLOW_START_WITHOUT_DB=1). API will return 503 until Postgres works.',
+      )
     } else {
-      console.log(`DTC API + Postgres listening on ${port}`)
+      console.error('Giving up. Fix DATABASE_URL / PG* vars, then redeploy. Set ALLOW_START_WITHOUT_DB=1 to boot the app anyway for debugging.')
+      process.exit(1)
+    }
+  }
+
+  app.listen(port, '0.0.0.0', () => {
+    if (isProd) {
+      console.log(`DTC server listening on ${port}, static from ${distDir}, dbReady=${dbReady}`)
+    } else {
+      console.log(`DTC API listening on ${port}, dbReady=${dbReady}`)
     }
   })
 })()
