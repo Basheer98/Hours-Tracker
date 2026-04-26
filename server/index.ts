@@ -82,6 +82,27 @@ function applySslToRemoteHosts(config: PoolConfig): PoolConfig {
   return config
 }
 
+/** Stops you from using tutorial placeholders that produce ENOTFOUND HOST:PORT */
+function assertNotPlaceholderPostgresConfig(config: PoolConfig): void {
+  const h = String(config.host ?? '').trim()
+  if (!h) {
+    return
+  }
+  if (/^host(:port)?$/i.test(h) || h.toUpperCase() === 'HOST:PORT') {
+    console.error(
+      'Your Postgres host is still a PLACEHOLDER (e.g. HOST or HOST:PORT in an example .env), not a real machine name.\n' +
+        'In Railway: open the Postgres service (not the web app) → Connect (or Variables) → copy the real URL or each value.\n' +
+        'In your web app service, set DATABASE_URL with "Variable Reference" from that Postgres, or set PGHOST to the real hostname (looks like xxxxx.railway.app or .rlwy.net), never the word HOST.',
+    )
+    process.exit(1)
+  }
+  const g = process.env.PGHOST?.trim() ?? ''
+  if (g && /^host(:port)?$/i.test(g)) {
+    console.error('PGHOST is the literal placeholder "HOST". Replace with the real PGHOST from the Postgres service Variables tab.')
+    process.exit(1)
+  }
+}
+
 function buildPoolConfig(): PoolConfig {
   let raw = normalizeDatabaseUrl(process.env.DATABASE_URL ?? '')
   const jsonUnwrapped = unwrapJsonDatabaseUrl(raw)
@@ -144,7 +165,9 @@ function buildPoolConfig(): PoolConfig {
   process.exit(1)
 }
 
-const pool = new Pool(buildPoolConfig())
+const poolConfig = buildPoolConfig()
+assertNotPlaceholderPostgresConfig(poolConfig)
+const pool = new Pool(poolConfig)
 const app = express()
 const port = Number(process.env.PORT) || 8787
 const requiredKey = process.env.DTC_API_KEY
@@ -193,7 +216,10 @@ function describePgError(err: unknown): string {
     return 'Postgres is not accepting connections (wrong host/port, or database not up yet).'
   }
   if (c === 'ENOTFOUND' || c === 'EAI_AGAIN') {
-    return 'Postgres host name could not be resolved. Check PGHOST / DATABASE_URL.'
+    if (e.message?.includes('HOST:PORT') || e.message?.includes('HOST')) {
+      return 'DNS could not resolve the database host. Your DATABASE_URL or PGHOST still contains the placeholder "HOST" or "HOST:PORT" — replace with the real host from Railway Postgres (e.g. *.railway.app), not example text from a tutorial.'
+    }
+    return 'Postgres host name could not be resolved. Check PGHOST / DATABASE_URL match the Railway Postgres "Connect" tab.'
   }
   if (c === 'ETIMEDOUT' || c === 'ESOCKETTIMEDOUT') {
     return 'Connection to Postgres timed out (security group, or wrong network URL).'
