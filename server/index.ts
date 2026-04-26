@@ -5,6 +5,7 @@ import { parseIntoClientConfig } from 'pg-connection-string'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pg, { type PoolConfig } from 'pg'
+import { parsePostgresConnectionStringLoose, unwrapJsonDatabaseUrl } from './pgUrl'
 
 const { Pool } = pg
 
@@ -82,7 +83,11 @@ function applySslToRemoteHosts(config: PoolConfig): PoolConfig {
 }
 
 function buildPoolConfig(): PoolConfig {
-  const raw = normalizeDatabaseUrl(process.env.DATABASE_URL ?? '')
+  let raw = normalizeDatabaseUrl(process.env.DATABASE_URL ?? '')
+  const jsonUnwrapped = unwrapJsonDatabaseUrl(raw)
+  if (jsonUnwrapped) {
+    raw = normalizeDatabaseUrl(jsonUnwrapped)
+  }
   if (!raw) {
     const fromEnv = buildPoolFromIndividualPgEnvs()
     if (fromEnv) {
@@ -116,6 +121,13 @@ function buildPoolConfig(): PoolConfig {
     }
   }
 
+  for (const candidate of unique) {
+    const manual = parsePostgresConnectionStringLoose(candidate)
+    if (manual) {
+      return applySslToRemoteHosts(manual)
+    }
+  }
+
   const fromEnv = buildPoolFromIndividualPgEnvs()
   if (fromEnv) {
     console.error(
@@ -124,12 +136,11 @@ function buildPoolConfig(): PoolConfig {
     return applySslToRemoteHosts(fromEnv)
   }
 
-  console.error(
-    'Could not parse DATABASE_URL. Check:\n' +
-      '• Variable Reference from the Postgres service (one line, no template syntax left in the value)\n' +
-      '• Or set PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE manually\n' +
-      '• Passwords with @ must be percent-encoded as %40 in the URL, or use the @-repair (retry deploy after update)',
-  )
+  const hint =
+    process.env.DATABASE_URL == null || process.env.DATABASE_URL.trim() === ''
+      ? 'DATABASE_URL is not set. In Railway, link Postgres and add a Reference, or set PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE on this service.'
+      : 'Copy the connection URL from Postgres again, or in this service add: PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE (from the Postgres service Variables tab) so the app can connect without parsing DATABASE_URL.'
+  console.error('Could not turn DATABASE_URL into a connection.\n' + hint)
   process.exit(1)
 }
 
