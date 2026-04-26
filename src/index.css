@@ -1,0 +1,19 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'DM Sans', system-ui, sans-serif;
+  --color-surface-900: #0b1220;
+  --color-surface-800: #111a2c;
+  --color-surface-700: #1a2740;
+  --color-accent: #22d3ee;
+}
+
+body {
+  @apply m-0 min-h-dvh antialiased;
+  @apply bg-[var(--color-surface-900)] text-slate-100;
+  font-family: var(--font-sans);
+}
+
+#root {
+  @apply min-h-dvh;
+}
