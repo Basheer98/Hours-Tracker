@@ -1,6 +1,7 @@
 import 'dotenv/config'
 import cors from 'cors'
 import express, { type Request, type Response, type NextFunction } from 'express'
+import { parseIntoClientConfig } from 'pg-connection-string'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pg, { type PoolConfig } from 'pg'
@@ -11,8 +12,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const distDir = path.join(__dirname, '../dist')
 const isProd = process.env.NODE_ENV === 'production'
 
+/** Common when pasting into Railway: wrapped in quotes, which breaks URL parsing. */
+function normalizeDatabaseUrl(s: string): string {
+  let t = s.replace(/^\uFEFF/, '').trim()
+  if (t.length >= 2) {
+    const q0 = t[0]
+    const q1 = t[t.length - 1]
+    if ((q0 === '"' && q1 === '"') || (q0 === "'" && q1 === "'")) {
+      t = t.slice(1, -1).trim()
+    }
+  }
+  return t
+}
+
 function buildPoolConfig(): PoolConfig {
-  const raw = (process.env.DATABASE_URL ?? '').trim()
+  const raw = normalizeDatabaseUrl(process.env.DATABASE_URL ?? '')
   if (!raw) {
     console.error('DATABASE_URL is missing or only whitespace.\n' +
       'In Railway: add a PostgreSQL service, then in your web service set DATABASE_URL to a Reference from that Postgres (it looks like postgres://...).',
@@ -26,36 +40,32 @@ function buildPoolConfig(): PoolConfig {
     )
     process.exit(1)
   }
+
+  let config: PoolConfig
   try {
-    void new URL(raw)
-  } catch {
+    config = parseIntoClientConfig(raw) as PoolConfig
+  } catch (err) {
     console.error(
-      'DATABASE_URL is not a valid URL for node-postgres.\n' +
-        'Do not type the string by hand. In Railway, open the Postgres plugin → use "Variable Reference" to inject its DATABASE_URL into this service.\n' +
-        'If you pasted manually, characters like @ or : in the password must be percent-encoded inside the URL.',
+      'Could not parse DATABASE_URL for PostgreSQL. Common fixes:\n' +
+        '1) In Railway, use a Variable *Reference* from the Postgres service (no quotes when pasting in the UI).\n' +
+        '2) If the password has @ or :, use the URL Railway generates — do not retype it.\n' +
+        'Underlying error:',
+      err,
     )
     process.exit(1)
   }
 
-  let useSsl: PoolConfig['ssl'] = false
   if (process.env.DATABASE_SSL === '0' || process.env.DATABASE_SSL === 'false') {
-    useSsl = false
+    config.ssl = false
   } else {
-    try {
-      const { hostname } = new URL(raw)
-      // Hosted DB (Railway, etc.) needs TLS; local Docker usually does not
-      if (hostname && hostname !== 'localhost' && hostname !== '127.0.0.1') {
-        useSsl = { rejectUnauthorized: false }
-      }
-    } catch {
-      // already exited above
+    const host = config.host ?? ''
+    const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1'
+    if (host && !isLocal) {
+      config.ssl = { rejectUnauthorized: false }
     }
   }
 
-  return {
-    connectionString: raw,
-    ssl: useSsl,
-  }
+  return config
 }
 
 const pool = new Pool(buildPoolConfig())
